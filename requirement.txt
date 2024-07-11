@@ -1,0 +1,11 @@
+sentencepiece
+transformers
+datasets
+sentence_transformers
+accelerate
+faiss-cpu
+torchmetrics
+nltk
+rouge # for non-chinese
+jieba # for chinese
+rouge-chinese # for chinese
