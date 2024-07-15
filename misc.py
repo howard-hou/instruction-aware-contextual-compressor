@@ -36,7 +36,6 @@ def recursive_round(item, precision=3):
         return item
 
 
-
 def estimate_remaining_time(start_time, completed, total):
     elapsed_time = time.time() - start_time
     if completed == 0:

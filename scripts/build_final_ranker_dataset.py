@@ -1,10 +1,3 @@
-'''
-This script is used to build prompter dataset. 
-medium dataset contains 2 parts:
-  - wikicn dataset
-  - dureader dataset
-'''
-
 import json
 from pathlib import Path
 from datasets import load_from_disk, concatenate_datasets, Dataset, DatasetDict
@@ -14,21 +7,21 @@ from transformers import AutoTokenizer
 document_paths = [
     "data/wikicn/wikipedia-cn-20230720-documents_all.json",
     "data/dureader/dureader-documents_all.json",
+    "data/T2Ranking/document_filter.json",
     ]
 dataset_paths = [
     "data/wikicn/wikipedia-cn-20230720-dataset",
     "data/dureader/dureader_dataset",
+    "data/T2Ranking/T2Ranking_train_dataset",
     ]
-output_path = "data/final_dataset/prompter_dataset"
+output_path = "data/final_dataset/wiki_dureader_T2Ranking_for_ranker"
 # input shape
-num_doc = 5
-doc_max_length = 1024
+num_doc = 20
+doc_max_length = 512
 ques_max_length = 32
-ans_max_length = 128
 # model config
-# model_name_or_path = "google/umt5-small"
 model_name_or_path = "/data/huggingface_model/umt5-small"
-num_proc = 16 # num of processes to use for data preprocessing
+num_proc = 32 # num of processes to use for data preprocessing
 
 # init tokenizer
 prompter_tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
@@ -81,19 +74,11 @@ def preprocess_dataset(example):
         truncation=True,
         max_length=ques_max_length,
     )
-    prompter_tokenzied_answer = prompter_tokenizer(
-        example["answer"], 
-        padding="max_length", 
-        truncation=True,
-        max_length=ans_max_length
-    )
     return {
         "document_input_ids": prompter_tokenzied_docs.input_ids,
         "document_attention_mask": prompter_tokenzied_docs.attention_mask,
         "prompter_question_input_ids": prompter_tokenzied_question.input_ids,
         "prompter_question_attention_mask": prompter_tokenzied_question.attention_mask,
-        "prompter_answer_input_ids": prompter_tokenzied_answer.input_ids,
-        "prompter_answer_attention_mask": prompter_tokenzied_answer.attention_mask,
     }
 
 all_dataset = DatasetDict()

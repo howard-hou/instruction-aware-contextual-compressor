@@ -76,8 +76,8 @@ def save_documents(hf_dataset, name, document_path):
     json.dump(documents, open(document_path, "w"), ensure_ascii=False, indent=2)
     return documents
 
-def build_documents_index(document_dataset):
-    # document_dataset = HfDataset.from_list(documents)
+def build_documents_index(documents):
+    document_dataset = HfDataset.from_list(documents)
     # 
     document_dataset_with_emb = document_dataset.map(
         lambda example: {'doc_embedding': model.encode(example["document"])}, 
@@ -107,10 +107,6 @@ def run_retriever(document_dataset_with_emb, question_dataset_with_emb, topk=100
     question_dataset_with_retrieval = question_dataset_with_emb.map(retrieve_topk_documents, 
                                                                     num_proc=num_proc,
                                                                     remove_columns=["question_embedding"])
-    # keep columns
-    keep_columns = ['question', 'answer', 'docid', 'retrieved_docids', 'retrieved_doc_scores']
-    question_dataset_with_retrieval = question_dataset_with_retrieval.remove_columns(
-        [col for col in question_dataset_with_retrieval.column_names if col not in keep_columns])
     return question_dataset_with_retrieval
 
 def compute_topk_accuracy(predictions, true_labels, topk=5):
@@ -147,36 +143,21 @@ def eval_retriever(question_dataset_with_retrieval):
     print(results)
     return results
 
-def get_shard_of_dataset(dataset, sample_per_shard=100000):
-    num_shards = len(dataset) // sample_per_shard + 1
-    for i in range(num_shards):
-        yield i, dataset.shard(num_shards=num_shards, index=i)
-    
-
 def process_one_dataset(dataset, out_dir):
-    print(f"process {dataset.name}, total size {len(dataset.hf_dataset)}")
+    print(f"process {dataset.name}")
     dataset_dir = out_dir / dataset.name
     dataset_dir.mkdir(exist_ok=True)
     hf_dataset = dataset.hf_dataset.rename_columns({"text_pos": "document", "text": "question"})
-    hf_dataset = hf_dataset.filter(lambda x: x["document"] is not None and len(x["document"]) > 0 and len(x["question"]) > 0)
     hf_dataset = hf_dataset.map(generate_docid, num_proc=args.num_proc)
-    save_documents(hf_dataset, dataset.name, dataset_dir / "documents.json")
-    eval_results = []
-    output_datasets = []
-    for i, shard in get_shard_of_dataset(hf_dataset):
-        print(f"process {dataset.name} - shard {i}")
-        document_dataset_with_emb = build_documents_index(shard)
-        question_dataset_with_emb = encode_question(shard)
-        question_dataset_with_retrieval = run_retriever(document_dataset_with_emb, 
-                                                        question_dataset_with_emb, 
-                                                        topk=100, 
-                                                        num_proc=args.num_proc)
-        eval_results.append(eval_retriever(question_dataset_with_retrieval))
-        output_datasets.append(question_dataset_with_retrieval)
-        if i == 1:
-            break
-    output_dataset = concatenate_datasets(output_datasets)
-    output_dataset.save_to_disk(dataset_dir)
+    documents = save_documents(hf_dataset, dataset.name, dataset_dir / "documents.json")
+    document_dataset_with_emb = build_documents_index(documents)
+    question_dataset_with_emb = encode_question(hf_dataset)
+    question_dataset_with_retrieval = run_retriever(document_dataset_with_emb, 
+                                                    question_dataset_with_emb, 
+                                                    topk=100, 
+                                                    num_proc=args.num_proc)
+    eval_results = eval_retriever(question_dataset_with_retrieval)
+    question_dataset_with_retrieval.save_to_disk(dataset_dir)
     json.dump(eval_results, open(dataset_dir /  "eval.json", "w"), ensure_ascii=False, indent=2)
 
 m3e_datasets = load_all_datasets(Path("M3E_dataset/"))

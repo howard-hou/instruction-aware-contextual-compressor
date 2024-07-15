@@ -33,7 +33,7 @@ class RetrievalMetrics:
     def compute(self) -> Dict[str, float]:
         predictions = torch.tensor(self.predictions).view(-1)
         targets = torch.tensor(self.targets).view(-1)
-        indexes = torch.tensor(self.indexes).view(-1)
+        indexes=torch.tensor(self.indexes).view(-1)
         score_dict = {}
         for topk in self.topk_list:
             score_dict[f"Recall@{topk}"] = RetrievalRecall(top_k=topk)(predictions, targets, indexes=indexes)

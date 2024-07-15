@@ -37,8 +37,8 @@ num_doc = 20
 doc_max_length = 512
 ques_max_length = 32
 # model config
-model_name_or_path = "google/umt5-small"
-# model_name_or_path = "/data/huggingface_model/umt5-small"
+#model_name_or_path = "google/umt5-small"
+model_name_or_path = "/data/huggingface_model/umt5-small"
 num_proc = 32 # num of processes to use for data preprocessing
 
 # init tokenizer

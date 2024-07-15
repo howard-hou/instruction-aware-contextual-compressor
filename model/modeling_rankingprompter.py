@@ -1390,8 +1390,10 @@ class RankingPrompter(UMT5Model):
         )
         # apply question attention mask
         soft_prompt_output = soft_prompt_output * question_attention_mask_expand.unsqueeze(-1)
+        # get the real mean by the real length
+        soft_prompt_output_mean = soft_prompt_output.sum(dim=2) / question_attention_mask_expand.sum(dim=2, keepdim=True)
         # [batch_size, num_doc, self.num_soft_prompt_tokens, hidden_size] -> [batch_size, num_doc]
-        ranking_logits = self.ranking_head(soft_prompt_output.mean(dim=2)).view(batch_size, num_doc)
+        ranking_logits = self.ranking_head(soft_prompt_output_mean).view(batch_size, num_doc)
 
         # rank loss
         loss_ranking = None
@@ -1412,6 +1414,7 @@ class RankingPrompter(UMT5Model):
                                             answer_attention_mask)
         # lm loss
         loss_lm = None
+        lm_logits = None
         if answer_input_ids is not None:
             # fill in question_input_ids with -100
             question_input_mask = torch.zeros_like(question_input_ids).fill_(-100)
@@ -1474,12 +1477,14 @@ class RankingPrompter(UMT5Model):
         return lm_logits[:, -1:, :]
     
 
-    def compute_grad_cam(self, 
-                         document_input_ids, 
-                         document_attention_mask, 
-                         question_input_ids, 
-                         question_attention_mask,
-                         block_num=-1):
+    def compute_ranking_grad_cam(
+            self,
+            document_input_ids, 
+            document_attention_mask, 
+            question_input_ids, 
+            question_attention_mask,
+            block_num=-1,
+            reduction="sum"):
         # 设置模型为evaluation模式, 开启保存attention map
         self.eval()
         attention_layer = self.decoder.block[block_num].layer[-2].EncDecAttention
@@ -1515,8 +1520,204 @@ class RankingPrompter(UMT5Model):
             # average over heads -> [bsz, ques_len, doc_len]
             gradcams = gradcams.mean(dim=1)
             # apply relu
-            # gradcams = gradcams.relu()
+            gradcams = gradcams.relu()
+        # apply question attention mask
+        gradcams = gradcams * question_attention_mask.unsqueeze(-1)
+        if reduction == "sum":
+            gradcams = gradcams.sum(dim=1)
+        elif reduction == "mean":
+            gradcams = gradcams.mean(dim=1)
         return gradcams
 
 
+    def compute_lm_grad_cam(
+            self,
+            document_input_ids, 
+            document_attention_mask, 
+            question_input_ids, 
+            question_attention_mask,
+            max_new_tokens=10,
+            block_num=-1, 
+            reduction="sum"):
+        # 设置模型为evaluation模式, 开启保存attention map
+        self.eval()
+        attention_layer = self.decoder.block[block_num].layer[-2].EncDecAttention
+        attention_layer.save_attention = True
 
+        # 正向传播以获取特征图
+        encoder_outputs = self.encode_document(document_input_ids, document_attention_mask)
+        document_embeds = encoder_outputs[0]
+
+        # append bos token id to question input ids
+        question_input_ids = torch.cat(
+            [question_input_ids, torch.ones_like(question_input_ids[:, :1]).fill_(self.config.decoder_start_token_id)], dim=1)
+        question_attention_mask = torch.cat(
+            [question_attention_mask, torch.ones_like(question_attention_mask[:, :1])], dim=1)
+
+
+        gradcams_output = []
+        tokens_output = []
+        for _ in range(max_new_tokens):
+            # 正向传播解码器以获取Grad-CAM
+            decoder_outputs = self.decoder(
+                input_ids=question_input_ids,
+                attention_mask=question_attention_mask,
+                encoder_hidden_states=document_embeds,
+                encoder_attention_mask=document_attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+            # get grads
+            lm_logits = (decoder_outputs.last_hidden_state @ self.decoder.embed_tokens.weight.t())[:, -1:, :].contiguous()
+            max_logits, max_indices = lm_logits.max(dim=-1)
+            loss = max_logits.sum()
+            question_input_ids = torch.cat([question_input_ids, max_indices], dim=-1)
+            question_attention_mask = torch.cat([question_attention_mask, torch.ones_like(question_attention_mask[:, :1])], dim=1)
+            tokens_output.append(max_indices)
+
+            self.zero_grad()
+            loss.backward(retain_graph=True)
+
+            # compute grad cam
+            with torch.no_grad():
+                # grads and cams [bsz, num_head, ques_len, doc_len]
+                grads = attention_layer.get_attn_gradients()
+                cams = attention_layer.get_attention_map()
+                gradcams = cams[:, :, -1:, :] * grads[:, :, -1:, :]
+                # average over heads -> [bsz, 1, doc_len]
+                gradcams = gradcams.mean(dim=1)
+                # apply relu
+                gradcams = gradcams.relu()
+                gradcams_output.append(gradcams)
+        # concat to [bsz, max_new_tokens, doc_len]
+        gradcams_output = torch.cat(gradcams_output, dim=1)
+        # concat to [bsz, max_new_tokens]
+        tokens_output = torch.cat(tokens_output, dim=1)
+        # mask eos token gradcam
+        gradcams_output = gradcams_output * (tokens_output != self.config.eos_token_id).unsqueeze(-1)
+        if reduction == "sum":
+            gradcams_output = gradcams_output.sum(dim=1)
+        elif reduction == "mean":
+            gradcams_output = gradcams_output.mean(dim=1)
+        return tokens_output, gradcams_output
+
+
+    def split_context_by_token_id(
+        self,
+        document_input_ids,
+        gradcams,
+        split_token_id = 310,
+    ):
+        bsz = document_input_ids.shape[0]
+        batch_doc_splits = []
+        for i in range(bsz):
+            one_doc = document_input_ids[i]
+            grad_cam = gradcams[i]
+            # find the split token index
+            split_idx = (one_doc == split_token_id).nonzero(as_tuple=True)[0]
+            # split the document input ids
+            num_split = len(split_idx)
+            if num_split > 0:
+                one_doc_splits = []
+                activation_splits = []
+                for i in range(num_split):
+                    if i == 0:
+                        # first split
+                        one_doc_splits.append(one_doc[:split_idx[i]])
+                        activation = grad_cam[:split_idx[i]].mean()
+                        activation_splits.append(activation)
+                    else:
+                        one_doc_splits.append(one_doc[split_idx[i-1]+1:split_idx[i]])
+                        activation = grad_cam[split_idx[i-1]+1:split_idx[i]].mean()
+                        activation_splits.append(activation)
+                # append the last split
+                one_doc_splits.append(one_doc[split_idx[-1]+1:])
+                activation = grad_cam[split_idx[-1]+1:].mean()
+                activation_splits.append(activation)
+            else:
+                # no split token in the document
+                one_doc_splits = [one_doc]
+                activation_splits = [grad_cam.mean()]
+            #
+            batch_doc_splits.append((one_doc_splits, activation_splits))
+        return batch_doc_splits
+
+
+    def drop_context_by_activation(
+        self,
+        batch_doc_splits,
+        keep_ratio=0.5,
+    ):
+        # if keep ratio is zero, raise a error
+        if keep_ratio == 0 or keep_ratio < 0 or keep_ratio == 0.0:
+            raise ValueError("keep ratio should not be zero or negative")
+        batch_doc_splits_drop = []
+        for one_doc_splits, activation_splits in batch_doc_splits:
+            sorted_idx = sorted(range(len(activation_splits)), key=lambda k: activation_splits[k], reverse=True)
+            # at least keep one context
+            num_drop = max(int(len(sorted_idx) * keep_ratio), 1)
+            # keep order of document
+            sorted_idx = sorted(sorted_idx[:num_drop])
+            one_doc_splits_drop = [one_doc_splits[i] for i in sorted_idx]
+            batch_doc_splits_drop.append(one_doc_splits_drop)
+        return batch_doc_splits_drop
+
+    def drop_context_by_avg_rank(
+        self,
+        batch_doc_splits_ranking,
+        batch_doc_splits_lm,
+        keep_ratio=0.5,
+    ):
+        # if keep ratio is zero, raise a error
+        if keep_ratio == 0 or keep_ratio < 0 or keep_ratio == 0.0:
+            raise ValueError("keep ratio should not be zero or negative")
+        batch_doc_splits_drop = []
+        bsz = len(batch_doc_splits_ranking)
+        for i in range(bsz):
+            one_doc_splits_ranking, activation_splits_ranking = batch_doc_splits_ranking[i]
+            one_doc_splits_lm, activation_splits_lm = batch_doc_splits_lm[i]
+            # sort by ranking activation
+            ranking_sorted_idx = sorted(range(len(activation_splits_ranking)), key=lambda k: activation_splits_ranking[k], reverse=True)
+            lm_sorted_idx = sorted(range(len(activation_splits_lm)), key=lambda k: activation_splits_lm[k], reverse=True)
+            # sort by average rank of ranking and lm
+            avg_rank = [(ranking_sorted_idx.index(i) + lm_sorted_idx.index(i)) / 2 for i in range(len(ranking_sorted_idx))]
+            sorted_idx = sorted(range(len(avg_rank)), key=lambda k: avg_rank[k])
+            # at least keep one context
+            num_drop = max(int(len(sorted_idx) * keep_ratio), 1)
+            # keep order of document
+            sorted_idx = sorted(sorted_idx[:num_drop])
+            one_doc_splits_drop = [one_doc_splits_ranking[i] for i in sorted_idx]
+            batch_doc_splits_drop.append(one_doc_splits_drop)
+        return batch_doc_splits_drop
+
+
+    def compress_context_by_activation(
+        self, 
+        document_input_ids, 
+        gradcams_output,
+        keep_ratio=0.5,
+    ):
+        # split context by split token id
+        batch_doc_splits = self.split_context_by_token_id(document_input_ids, gradcams_output)
+        # drop context by activation
+        batch_doc_splits_drop = self.drop_context_by_activation(batch_doc_splits, keep_ratio)
+        return batch_doc_splits_drop
+
+
+    def compress_context(
+        self, 
+        document_input_ids, 
+        ranking_gradcams,
+        lm_gradcams,
+        keep_ratio=0.5,
+    ):
+        # split context by split token id
+        batch_doc_splits_ranking = self.split_context_by_token_id(document_input_ids, ranking_gradcams)
+        batch_doc_splits_lm = self.split_context_by_token_id(document_input_ids, lm_gradcams)
+        # drop context by activation
+        batch_doc_splits_drop = self.drop_context_by_avg_rank(
+            batch_doc_splits_ranking, batch_doc_splits_lm, keep_ratio)
+        return batch_doc_splits_drop
+
+
+        
